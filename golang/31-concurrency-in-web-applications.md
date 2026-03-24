@@ -1,12 +1,33 @@
 # Chapter 31: Concurrency in Web Applications
 
-> **Level: Applied / Production** | **Prerequisites: Chapters 10 (Goroutines), 11 (Channels & Select), 16 (Context), 17 (Advanced Concurrency), 21 (Building Microservices)**
-
 This chapter is not theory. Chapters 10, 11, 16, and 17 taught you what goroutines, channels, mutexes, WaitGroups, errgroup, and context are. This chapter teaches you **where they appear in a real production Go API** -- the kind you deploy to a server, point a domain at, and let thousands of users hit concurrently.
 
-Every pattern in this chapter is drawn from real-world Go API projects. We will build actual middleware, actual background workers, actual graceful shutdown sequences. If you have built Express.js APIs in Node.js, the comparisons will be explicit and frequent. If you have not, the Go patterns stand entirely on their own.
+Every pattern in this chapter is drawn from real-world Go API projects like "krafty-core." We will build actual middleware, actual background workers, actual rate limiters, and actual graceful shutdown sequences. If you have built Express.js APIs in Node.js, the comparisons will be explicit and frequent. If you have not, the Go patterns stand entirely on their own.
 
 By the end of this chapter you will understand how concurrency is woven into every layer of a Go web application -- from the moment a TCP connection arrives to the moment the server shuts down cleanly.
+
+---
+
+## Prerequisites
+
+Before reading this chapter, you should be comfortable with:
+
+- **Chapter 10:** Goroutines and Concurrency Basics
+- **Chapter 11:** Channels and Select
+- **Chapter 12:** JSON, HTTP, and REST APIs
+- **Chapter 16:** The Context Package
+- **Chapter 17:** Advanced Concurrency (sync.Mutex, WaitGroup, errgroup)
+- **Chapter 25:** Middleware Patterns in Practice
+- **Chapter 30:** Graceful Shutdown and Production Patterns
+
+You should also understand basic concepts of:
+
+- HTTP servers and request handling
+- Database connection pools (Chapter 26)
+- Authentication with tokens (Chapter 27)
+- The `http.Handler` interface and `http.HandlerFunc`
+
+If you have built Express.js middleware before, the conceptual mapping will be immediate -- but the implementation details differ in critical ways because Go runs your handler in a separate goroutine for every request.
 
 ---
 
@@ -40,13 +61,13 @@ When a request arrives at a Go HTTP server, the runtime spawns a **new goroutine
 
 ```
 Go HTTP Server                          Node.js / Express Server
-─────────────────                       ─────────────────────────
+-----------------                       -------------------------
 
-Request 1 ──► goroutine 1              Request 1 ──► event loop
-Request 2 ──► goroutine 2              Request 2 ──► event loop (waits)
-Request 3 ──► goroutine 3              Request 3 ──► event loop (waits)
+Request 1 --> goroutine 1              Request 1 --> event loop
+Request 2 --> goroutine 2              Request 2 --> event loop (waits)
+Request 3 --> goroutine 3              Request 3 --> event loop (waits)
    ...           ...                       ...           ...
-Request N ──► goroutine N              Request N ──► event loop (waits)
+Request N --> goroutine N              Request N --> event loop (waits)
 
 Each goroutine:                         The event loop:
  - Has its own stack (~2KB initial)      - Runs ONE callback at a time
@@ -80,7 +101,7 @@ func hashHandler(w http.ResponseWriter, r *http.Request) {
 		data = "default"
 	}
 
-	// CPU-intensive: hash the data 100,000 times
+	// CPU-intensive: hash the data 100,000 times.
 	// In Node.js, this would block the event loop and freeze ALL requests.
 	// In Go, only this goroutine is busy. Other requests proceed normally.
 	result := []byte(data)
@@ -95,7 +116,7 @@ func hashHandler(w http.ResponseWriter, r *http.Request) {
 
 // This handler simulates a slow database query.
 // In Go, the goroutine is parked during the sleep. Other goroutines run freely.
-// In Node.js, you'd use await -- but the callback scheduling still goes
+// In Node.js, you would use await -- but the callback scheduling still goes
 // through the single event loop.
 func slowQueryHandler(w http.ResponseWriter, r *http.Request) {
 	// Simulates a 2-second database query
@@ -145,33 +166,43 @@ app.listen(8080);
 Here is every place concurrency plays a role in a typical production Go API. Each of these will be covered in detail in this chapter:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Go API Concurrency Map                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  INCOMING REQUEST                                               │
-│  ├── net/http spawns a goroutine per request                    │
-│  ├── Rate limiter middleware (sync.Mutex on shared map)         │
-│  ├── Auth middleware (reads shared config, sync.Once)           │
-│  │                                                              │
-│  HANDLER LAYER                                                  │
-│  ├── Context from request (cancellation if client disconnects)  │
-│  ├── Parallel DB queries (errgroup)                             │
-│  ├── Database connection pool (pgx pool, semaphore-like)        │
-│  │                                                              │
-│  BACKGROUND GOROUTINES                                          │
-│  ├── Rate limiter cleanup (time.Ticker + goroutine)             │
-│  ├── Expired token cleanup (time.Ticker + goroutine)            │
-│  ├── Worker pool for async jobs (channels + goroutines)         │
-│  │                                                              │
-│  SHUTDOWN                                                       │
-│  ├── Signal handling (os.Signal channel)                        │
-│  ├── HTTP server graceful shutdown (context + timeout)          │
-│  ├── Background goroutine shutdown (context cancel + WaitGroup) │
-│  └── Database pool close                                        │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------------+
+|                    Go API Concurrency Map                          |
++-------------------------------------------------------------------+
+|                                                                    |
+|  INCOMING REQUEST                                                  |
+|  +-- net/http spawns a goroutine per request                       |
+|  +-- Rate limiter middleware (sync.Mutex on shared map)            |
+|  +-- Auth middleware (reads shared config, sync.Once)              |
+|  |                                                                 |
+|  HANDLER LAYER                                                     |
+|  +-- Context from request (cancellation if client disconnects)     |
+|  +-- Parallel DB queries (errgroup)                                |
+|  +-- Database connection pool (pgx pool, semaphore-like)           |
+|  |                                                                 |
+|  BACKGROUND GOROUTINES                                             |
+|  +-- Rate limiter cleanup (time.Ticker + goroutine)                |
+|  +-- Expired token cleanup (time.Ticker + goroutine)               |
+|  +-- Worker pool for async jobs (channels + goroutines)            |
+|  |                                                                 |
+|  SHUTDOWN                                                          |
+|  +-- Signal handling (os.Signal channel)                           |
+|  +-- HTTP server graceful shutdown (context + timeout)             |
+|  +-- Background goroutine shutdown (context cancel + WaitGroup)    |
+|  +-- Database pool close                                           |
+|                                                                    |
++-------------------------------------------------------------------+
 ```
+
+### The Key Implication for Go Developers
+
+Because every request runs in a separate goroutine, **any state shared between requests is shared between goroutines**. This includes:
+
+- Package-level variables (maps, slices, structs)
+- Struct fields on your handler or middleware
+- Anything closed over by a `http.HandlerFunc` literal
+
+If you write to a shared map from two handlers without a mutex, your server will crash in production. This is the single most important lesson in Go web concurrency: **your handlers run concurrently, so shared state must be synchronized.**
 
 ---
 
@@ -290,22 +321,22 @@ The `rate.Limiter` from `golang.org/x/time/rate` implements a **token bucket** a
 
 ```
 Token Bucket Algorithm
-──────────────────────
+----------------------
 
 Bucket capacity (burst): 10 tokens
 Refill rate: 5 tokens/second
 
- Time 0.0s:  [●●●●●●●●●●]  10/10 tokens (full)
- Request  →  [●●●●●●●●● ]   9/10 tokens (allowed)
- Request  →  [●●●●●●●●  ]   8/10 tokens (allowed)
- ...8 more →  [          ]   0/10 tokens (allowed -- used all burst)
- Request  →  DENIED (0 tokens, must wait)
+ Time 0.0s:  [**********]  10/10 tokens (full)
+ Request  ->  [********* ]   9/10 tokens (allowed)
+ Request  ->  [********  ]   8/10 tokens (allowed)
+ ...8 more -> [          ]   0/10 tokens (allowed -- used all burst)
+ Request  ->  DENIED (0 tokens, must wait)
 
- Time 0.2s:  [●         ]   1/10 tokens (refilled 1 token after 0.2s)
- Request  →  [          ]   0/10 tokens (allowed)
- Request  →  DENIED
+ Time 0.2s:  [*         ]   1/10 tokens (refilled 1 token after 0.2s)
+ Request  ->  [          ]   0/10 tokens (allowed)
+ Request  ->  DENIED
 
- Time 1.0s:  [●●●●●     ]   5/10 tokens (refilled 5 tokens in 1s)
+ Time 1.0s:  [*****     ]   5/10 tokens (refilled 5 tokens in 1s)
 ```
 
 The key insight: `burst` controls how many requests can happen in a quick burst, while `rate` controls the sustained throughput. For API rate limiting:
@@ -317,14 +348,14 @@ The key insight: `burst` controls how many requests can happen in a quick burst,
 
 ```
 Goroutine 1 (Request from 1.2.3.4)     Goroutine 2 (Request from 5.6.7.8)
-─────────────────────────────────────   ─────────────────────────────────────
-rl.mu.Lock()    ← acquires lock
-                                        rl.mu.Lock()    ← BLOCKS (waits)
+-----------------------------------     -----------------------------------
+rl.mu.Lock()    <-- acquires lock
+                                        rl.mu.Lock()    <-- BLOCKS (waits)
 v = rl.visitors["1.2.3.4"]
 v.lastSeen = time.Now()
 v.limiter.Allow()
-rl.mu.Unlock()  ← releases lock
-                                        ← unblocked, acquires lock
+rl.mu.Unlock()  <-- releases lock
+                                        <-- unblocked, acquires lock
                                         v = rl.visitors["5.6.7.8"]
                                         v.lastSeen = time.Now()
                                         v.limiter.Allow()
@@ -358,7 +389,7 @@ app.use(limiter);
 // For production with multiple Node.js processes (cluster mode),
 // you need an external store like Redis:
 const RedisStore = require('rate-limit-redis');
-const limiter = rateLimit({
+const limiterWithRedis = rateLimit({
     store: new RedisStore({ client: redisClient }),
     windowMs: 1000,
     max: 5,
@@ -551,12 +582,34 @@ Background cleanup with tickers follows a universal pattern in Go servers:
 ```
 1. Create a time.Ticker
 2. Loop with select:
-   - ctx.Done() → return (clean shutdown)
-   - ticker.C   → do work
+   - ctx.Done() -> return (clean shutdown)
+   - ticker.C   -> do work
 3. defer ticker.Stop() to prevent goroutine leak in the runtime
 ```
 
 You will see this pattern in rate limiter cleanup, token expiry, cache eviction, metrics reporting, health checks, and connection pool maintenance. Every long-running background task in a Go server follows this structure.
+
+### Visualizing the Cleanup Lifecycle
+
+```
+Server starts
+    |
+    v
+NewRateLimiter(ctx, 5, 10)
+    |
+    +-- go rl.startCleanup(ctx, 1*time.Minute)
+    |       |
+    |       +-- ticker fires every 1 minute
+    |       |   +-- Lock, iterate map, delete stale entries, Unlock
+    |       |   +-- ticker fires again...
+    |       |
+    |       +-- ctx.Done() fires (server shutting down)
+    |       |   +-- return (goroutine exits cleanly)
+    |
+    +-- HTTP requests call rl.Allow(ip)
+            |
+            +-- Lock, check map, update lastSeen, Unlock
+```
 
 ---
 
@@ -740,13 +793,13 @@ In a real API, the context flows from the HTTP request through every layer:
 
 ```
 HTTP Request
-  └── r.Context()
-       └── middleware (adds values: userID, requestID)
-            └── handler
-                 └── service layer
-                      └── repository layer
-                           └── database driver (pgx, sql.DB)
-                                └── actual SQL query
+  +-- r.Context()
+       +-- middleware (adds values: userID, requestID)
+            +-- handler
+                 +-- service layer
+                      +-- repository layer
+                           +-- database driver (pgx, sql.DB)
+                                +-- actual SQL query
 
 If the client disconnects at ANY point, ctx.Done() fires,
 and the cancellation propagates to the deepest layer.
@@ -869,23 +922,19 @@ In Go, context cancellation is **built into the request lifecycle**. You do not 
 A database connection pool maintains a fixed number of open connections to the database. When a handler needs to run a query, it borrows a connection from the pool, uses it, and returns it. This is inherently a concurrency problem: hundreds of goroutines might need a connection simultaneously, but the pool might only have 25 connections.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                  Connection Pool (25 connections)                │
-│                                                                 │
-│  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐   ...   ┌────┐           │
-│  │ C1 │ │ C2 │ │ C3 │ │ C4 │ │ C5 │         │C25 │           │
-│  └──┬─┘ └──┬─┘ └──┬─┘ └──┬─┘ └──┬─┘         └──┬─┘           │
-│     │      │      │      │      │               │              │
-│  ┌──┴──┐┌──┴──┐┌──┴──┐┌──┴──┐┌──┴──┐        ┌──┴──┐          │
-│  │ G1  ││ G2  ││ G3  ││ G4  ││ G5  │        │ G25 │          │
-│  └─────┘└─────┘└─────┘└─────┘└─────┘        └─────┘          │
-│                                                                 │
-│  Goroutines G26, G27, ... G500:  BLOCKED (waiting for a free   │
-│  connection). They are parked by the runtime -- not spinning.   │
-│                                                                 │
-│  When G1 finishes its query, it returns C1 to the pool.         │
-│  G26 wakes up, acquires C1, and proceeds.                       │
-└─────────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------------+
+|                  Connection Pool (25 connections)                   |
+|                                                                    |
+|  [C1] [C2] [C3] [C4] [C5]   ...   [C25]                          |
+|   |    |    |    |    |              |                              |
+|  [G1] [G2] [G3] [G4] [G5]         [G25]                           |
+|                                                                    |
+|  Goroutines G26, G27, ... G500:  BLOCKED (waiting for a free       |
+|  connection). They are parked by the runtime -- not spinning.      |
+|                                                                    |
+|  When G1 finishes its query, it returns C1 to the pool.            |
+|  G26 wakes up, acquires C1, and proceeds.                          |
++-------------------------------------------------------------------+
 ```
 
 ### pgx Pool Configuration
@@ -1070,6 +1119,44 @@ Scenario: 200 concurrent requests, pool size = 25
   4. Monitor pool stats (idle, acquired, waiting)
 ```
 
+### Pool Concurrency and pgx Internals
+
+The `pgxpool.Pool` internally uses a semaphore-like mechanism to manage connections. When you call `pool.Query(ctx, ...)`, it:
+
+1. Tries to acquire an idle connection from the internal free list
+2. If none available and under MaxConns, creates a new connection
+3. If at MaxConns, blocks until a connection is returned or ctx is cancelled
+4. Returns the connection to the free list when `rows.Close()` is called
+
+This is why `defer rows.Close()` is critical -- forgetting it permanently leaks a connection from the pool. After `MaxConns` leaks, your API stops responding to any database query.
+
+### Node.js Comparison
+
+```javascript
+// Node.js with pg (node-postgres) -- similar concept, different mechanics
+const { Pool } = require('pg');
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 25,                    // Same as MaxConns
+    idleTimeoutMillis: 30000,   // Same as MaxConnIdleTime
+    connectionTimeoutMillis: 5000, // Context timeout equivalent
+});
+
+// The pool handles concurrency internally.
+// In Node.js, the event loop means requests are processed one at a time,
+// so the pool mostly manages connections across async operations.
+app.get('/api/data', async (req, res) => {
+    const client = await pool.connect(); // May block if pool exhausted
+    try {
+        const result = await client.query('SELECT * FROM users');
+        res.json(result.rows);
+    } finally {
+        client.release(); // Same as defer rows.Close()
+    }
+});
+```
+
 ---
 
 ## 6. Parallel Database Queries with errgroup
@@ -1079,10 +1166,10 @@ Scenario: 200 concurrent requests, pool size = 25
 A dashboard endpoint needs data from three different tables: user stats, recent sessions, and progress. Sequentially, this takes the sum of all three query times. In parallel, it takes the time of the slowest query.
 
 ```
-Sequential:  ──[Stats 80ms]──[Sessions 120ms]──[Progress 60ms]──  = 260ms total
-Parallel:    ──[Stats 80ms     ]──
-             ──[Sessions 120ms      ]──                             = 120ms total
-             ──[Progress 60ms ]──
+Sequential:  --[Stats 80ms]--[Sessions 120ms]--[Progress 60ms]--  = 260ms total
+Parallel:    --[Stats 80ms     ]--
+             --[Sessions 120ms      ]--                             = 120ms total
+             --[Progress 60ms ]--
 ```
 
 ### The errgroup Solution
@@ -1122,31 +1209,36 @@ type Session struct {
 }
 
 type Progress struct {
-	Level          int     `json:"level"`
-	XP             int     `json:"xp"`
-	CompletionPct  float64 `json:"completionPct"`
+	Level         int     `json:"level"`
+	XP            int     `json:"xp"`
+	CompletionPct float64 `json:"completionPct"`
 }
 
 // Simulated repositories -- replace with actual DB calls.
 
 type StatsRepo struct{}
+
 func (r *StatsRepo) GetStats(ctx context.Context, userID string) (*Stats, error) {
 	select {
-	case <-time.After(80 * time.Millisecond): // Simulate 80ms query
-		return &Stats{TotalSessions: 142, TotalMinutes: 4260, AverageScore: 87.3}, nil
+	case <-time.After(80 * time.Millisecond): // Simulates 80ms query
+		return &Stats{
+			TotalSessions: 142,
+			TotalMinutes:  4260,
+			AverageScore:  87.5,
+		}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
 type SessionRepo struct{}
+
 func (r *SessionRepo) GetRecent(ctx context.Context, userID string, limit int) ([]*Session, error) {
 	select {
-	case <-time.After(120 * time.Millisecond): // Simulate 120ms query
+	case <-time.After(120 * time.Millisecond): // Simulates 120ms query
 		return []*Session{
 			{ID: "s1", Topic: "Go Concurrency", Score: 92, CreatedAt: time.Now().Add(-1 * time.Hour)},
 			{ID: "s2", Topic: "HTTP Handlers", Score: 88, CreatedAt: time.Now().Add(-2 * time.Hour)},
-			{ID: "s3", Topic: "Context Package", Score: 95, CreatedAt: time.Now().Add(-3 * time.Hour)},
 		}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1154,65 +1246,77 @@ func (r *SessionRepo) GetRecent(ctx context.Context, userID string, limit int) (
 }
 
 type ProgressRepo struct{}
+
 func (r *ProgressRepo) GetProgress(ctx context.Context, userID string) (*Progress, error) {
 	select {
-	case <-time.After(60 * time.Millisecond): // Simulate 60ms query
-		return &Progress{Level: 12, XP: 3400, CompletionPct: 68.5}, nil
+	case <-time.After(60 * time.Millisecond): // Simulates 60ms query
+		return &Progress{
+			Level:         7,
+			XP:            3450,
+			CompletionPct: 68.5,
+		}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-// Handler uses errgroup to fetch all data in parallel.
-
-type DashboardHandler struct {
-	statsRepo    *StatsRepo
-	sessionRepo  *SessionRepo
-	progressRepo *ProgressRepo
-}
-
+// DashboardResponse combines data from multiple sources.
 type DashboardResponse struct {
 	Stats    *Stats     `json:"stats"`
 	Sessions []*Session `json:"sessions"`
 	Progress *Progress  `json:"progress"`
 }
 
-func (h *DashboardHandler) GetDashboard(w http.ResponseWriter, r *http.Request) {
+type DashboardHandler struct {
+	stats    *StatsRepo
+	sessions *SessionRepo
+	progress *ProgressRepo
+}
+
+func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID := "user-123" // In production: extract from auth middleware
 
-	// errgroup.WithContext creates a new group AND a derived context.
-	// If any goroutine returns an error, gCtx is cancelled -- which cancels
-	// all other goroutines in the group.
-	g, gCtx := errgroup.WithContext(ctx)
+	var response DashboardResponse
 
-	// Each variable is written by exactly one goroutine, so no mutex needed.
-	var stats *Stats
-	var sessions []*Session
-	var progress *Progress
+	// Create an errgroup with the request context.
+	// If any query fails, the derived context is cancelled, stopping the others.
+	g, ctx := errgroup.WithContext(ctx)
 
+	// Query 1: Fetch stats
 	g.Go(func() error {
-		var err error
-		stats, err = h.statsRepo.GetStats(gCtx, userID)
-		return err
+		stats, err := h.stats.GetStats(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("fetch stats: %w", err)
+		}
+		response.Stats = stats
+		return nil
 	})
 
+	// Query 2: Fetch recent sessions
 	g.Go(func() error {
-		var err error
-		sessions, err = h.sessionRepo.GetRecent(gCtx, userID, 10)
-		return err
+		sessions, err := h.sessions.GetRecent(ctx, userID, 5)
+		if err != nil {
+			return fmt.Errorf("fetch sessions: %w", err)
+		}
+		response.Sessions = sessions
+		return nil
 	})
 
+	// Query 3: Fetch progress
 	g.Go(func() error {
-		var err error
-		progress, err = h.progressRepo.GetProgress(gCtx, userID)
-		return err
+		progress, err := h.progress.GetProgress(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("fetch progress: %w", err)
+		}
+		response.Progress = progress
+		return nil
 	})
 
-	// Wait blocks until all goroutines complete or one returns an error.
+	// Wait for all queries to complete.
+	// g.Wait() returns the first non-nil error from any goroutine.
 	if err := g.Wait(); err != nil {
 		if ctx.Err() != nil {
-			// The original request context was cancelled (client disconnected).
 			log.Printf("Dashboard request cancelled: %v", ctx.Err())
 			return
 		}
@@ -1221,103 +1325,113 @@ func (h *DashboardHandler) GetDashboard(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// All three queries succeeded. Write the response.
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(DashboardResponse{
-		Stats:    stats,
-		Sessions: sessions,
-		Progress: progress,
-	})
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
 	handler := &DashboardHandler{
-		statsRepo:    &StatsRepo{},
-		sessionRepo:  &SessionRepo{},
-		progressRepo: &ProgressRepo{},
+		stats:    &StatsRepo{},
+		sessions: &SessionRepo{},
+		progress: &ProgressRepo{},
 	}
 
-	http.HandleFunc("/api/dashboard", handler.GetDashboard)
+	http.Handle("/api/dashboard", handler)
 
-	log.Println("Server running on :8080")
-	log.Println("Try: curl localhost:8080/api/dashboard")
+	log.Println("Server on :8080 -- GET /api/dashboard")
 	http.ListenAndServe(":8080", nil)
 }
 ```
 
-### Why errgroup, Not Manual WaitGroup + Channels
+### Why Each Goroutine Can Safely Write to response
+
+You might wonder: is it safe for three goroutines to write to `response.Stats`, `response.Sessions`, and `response.Progress` simultaneously? Yes, because:
+
+1. Each goroutine writes to a **different field** of the struct.
+2. Go's memory model guarantees that `g.Wait()` synchronizes all writes -- after `g.Wait()` returns, all goroutine writes are visible to the main goroutine.
+3. No two goroutines ever write to the same field.
+
+If two goroutines wrote to the **same** field, you would need a mutex. But the errgroup pattern is designed so each goroutine handles one independent piece of data.
+
+### errgroup with Concurrency Limits
+
+If you are making many parallel requests (e.g., fetching 50 items), you can limit the concurrency to avoid overwhelming the database pool or a downstream service:
 
 ```go
-// VERBOSE: Manual WaitGroup + error channel
-func getStatsManual(ctx context.Context, userID string) (*Stats, []*Session, *Progress, error) {
-	var wg sync.WaitGroup
-	errCh := make(chan error, 3) // Buffered to avoid goroutine leak
+package main
 
-	var stats *Stats
-	var sessions []*Session
-	var progress *Progress
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
 
-	wg.Add(3)
+	"golang.org/x/sync/errgroup"
+)
 
-	go func() {
-		defer wg.Done()
-		var err error
-		stats, err = getStats(ctx, userID)
-		if err != nil {
-			errCh <- err
-		}
-	}()
+func main() {
+	ctx := context.Background()
 
-	go func() {
-		defer wg.Done()
-		var err error
-		sessions, err = getSessions(ctx, userID)
-		if err != nil {
-			errCh <- err
-		}
-	}()
+	// SetLimit caps the number of concurrent goroutines.
+	// This prevents overwhelming the database connection pool.
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(5) // At most 5 concurrent queries
 
-	go func() {
-		defer wg.Done()
-		var err error
-		progress, err = getProgress(ctx, userID)
-		if err != nil {
-			errCh <- err
-		}
-	}()
+	userIDs := []string{"u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8", "u9", "u10"}
+	results := make([]string, len(userIDs))
 
-	wg.Wait()
-	close(errCh)
-
-	// Check if any errors occurred
-	for err := range errCh {
-		return nil, nil, nil, err // Returns first error
+	for i, uid := range userIDs {
+		i, uid := i, uid // Capture for goroutine (not needed in Go 1.22+)
+		g.Go(func() error {
+			// Simulate a database query
+			select {
+			case <-time.After(100 * time.Millisecond):
+				results[i] = fmt.Sprintf("data for %s", uid)
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
 	}
 
-	return stats, sessions, progress, nil
+	if err := g.Wait(); err != nil {
+		log.Fatal(err)
+	}
+
+	for _, r := range results {
+		fmt.Println(r)
+	}
 }
 ```
 
-The errgroup version is cleaner, handles cancellation automatically, and is the idiomatic Go approach.
+### Node.js Comparison
 
-### Cancellation Behavior
+```javascript
+// Node.js: Promise.all for parallel queries
+app.get('/api/dashboard', async (req, res) => {
+    const userId = req.user.id;
 
-```
-Scenario: Stats query fails after 30ms. Sessions and Progress are still running.
+    try {
+        // Promise.all runs all promises concurrently.
+        // This is the direct equivalent of errgroup.
+        const [stats, sessions, progress] = await Promise.all([
+            getStats(userId),
+            getRecentSessions(userId, 5),
+            getProgress(userId),
+        ]);
 
-With errgroup.WithContext:
-  1. Stats goroutine returns error at 30ms
-  2. errgroup cancels gCtx
-  3. Sessions goroutine (at 30ms into its 120ms query) sees gCtx.Done() and returns
-  4. Progress goroutine (at 30ms into its 60ms query) sees gCtx.Done() and returns
-  5. g.Wait() returns at ~30ms with the Stats error
+        res.json({ stats, sessions, progress });
+    } catch (err) {
+        // Unlike errgroup, Promise.all does NOT cancel other promises
+        // when one fails. The other queries keep running and their
+        // results are discarded.
+        res.status(500).json({ error: 'failed to load dashboard' });
+    }
+});
 
-Without errgroup.WithContext (just errgroup.Group):
-  1. Stats goroutine returns error at 30ms
-  2. Sessions goroutine keeps running for the full 120ms
-  3. Progress goroutine keeps running for the full 60ms
-  4. g.Wait() returns at 120ms with the Stats error
-  5. 90ms wasted on queries whose results are thrown away
+// errgroup advantage: if getStats fails, the context is cancelled,
+// and getRecentSessions and getProgress stop immediately.
+// Promise.all: they keep running, wasting resources.
 ```
 
 ---
@@ -1326,7 +1440,7 @@ Without errgroup.WithContext (just errgroup.Group):
 
 ### The Problem
 
-Authentication systems that use refresh tokens must periodically clean up expired tokens from the database. If you don't, the tokens table grows without bound. In a krafty-core style API, this is a background goroutine that runs every hour and deletes tokens that have passed their expiry time.
+Authentication systems that use refresh tokens must periodically clean up expired tokens from the database. If you do not, the tokens table grows without bound. In a krafty-core style API, this is a background goroutine that runs every hour and deletes tokens that have passed their expiry time.
 
 ### The Implementation
 
@@ -1484,6 +1598,21 @@ func (s *BackgroundService) Stop() {
 
 The WaitGroup guarantees that when `Stop()` returns, the goroutine is fully finished. This is critical during server shutdown -- you must not close the database pool until all background goroutines that use it have stopped.
 
+### Why This Pattern Is Production-Critical
+
+In a krafty-core style API, you might have several background services running:
+
+```
+Background Services:
+  +-- Token cleanup (every 1 hour)
+  +-- Rate limiter cleanup (every 1 minute)
+  +-- Session expiry (every 30 minutes)
+  +-- Metrics flush (every 10 seconds)
+  +-- Health check pinger (every 5 seconds)
+```
+
+Each one follows the same Start/Stop lifecycle. During shutdown, you cancel the shared context and call Stop() on each. The WaitGroup ensures you wait for all of them before closing the database pool.
+
 ---
 
 ## 8. Concurrent Request Processing -- How Go's HTTP Server Works
@@ -1547,8 +1676,8 @@ import (
 )
 
 var (
-	activeRequests  atomic.Int64
-	totalRequests   atomic.Int64
+	activeRequests atomic.Int64
+	totalRequests  atomic.Int64
 )
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -1600,7 +1729,6 @@ ab -n 1000 -c 100 http://localhost:8080/api/work
 package main
 
 import (
-	"context"
 	"log"
 	"net/http"
 	"time"
@@ -1673,6 +1801,16 @@ Node.js with CPU-bound handlers:
   - Complex code to coordinate
 ```
 
+### Why Go Does Not Need Connection Limits (Usually)
+
+In Node.js frameworks, you often set a max concurrent connections limit. In Go, the goroutine model handles this naturally because:
+
+1. Goroutine creation is cheap (~2KB stack, ~1 microsecond to create)
+2. Blocked goroutines consume almost no CPU (they are parked by the scheduler)
+3. The Go scheduler efficiently multiplexes thousands of goroutines onto a few OS threads
+
+The bottleneck in a Go server is typically the database connection pool, not the goroutine count. A server can handle 50,000 concurrent goroutines but only has 25 database connections -- the pool is the natural back-pressure mechanism.
+
 ---
 
 ## 9. Shared State Protection Patterns -- Mutex vs Channel vs Atomic
@@ -1682,32 +1820,32 @@ Node.js with CPU-bound handlers:
 In a web application, you will encounter shared state constantly. The question is always: **which synchronization primitive should I use?**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              SHARED STATE DECISION TREE                          │
-│                                                                 │
-│  Is it a simple counter or flag?                                │
-│  ├── YES → Use sync/atomic (fastest, lock-free)                 │
-│  │         Examples: request counter, active connections,       │
-│  │                   feature flag (bool), health status         │
-│  │                                                              │
-│  └── NO → Is it protecting a data structure (map, slice, etc.)? │
-│       ├── YES → Is it mostly reads, rare writes?                │
-│       │    ├── YES → Use sync.RWMutex                           │
-│       │    │         Examples: config cache, feature flags map,  │
-│       │    │                   route table                       │
-│       │    │                                                     │
-│       │    └── NO → Use sync.Mutex                              │
-│       │             Examples: rate limiter map (every call       │
-│       │                       writes), session store            │
-│       │                                                         │
-│       └── NO → Is it coordinating between goroutines?           │
-│            ├── YES → Use channels                               │
-│            │         Examples: job queue, results collection,    │
-│            │                   shutdown signaling                │
-│            │                                                     │
-│            └── Need one-time init? → Use sync.Once              │
-│                Examples: DB connection, config loading           │
-└─────────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------------+
+|              SHARED STATE DECISION TREE                             |
+|                                                                    |
+|  Is it a simple counter or flag?                                   |
+|  +-- YES -> Use sync/atomic (fastest, lock-free)                   |
+|  |          Examples: request counter, active connections,         |
+|  |                    feature flag (bool), health status           |
+|  |                                                                 |
+|  +-- NO -> Is it protecting a data structure (map, slice, etc.)?   |
+|       +-- YES -> Is it mostly reads, rare writes?                  |
+|       |    +-- YES -> Use sync.RWMutex                             |
+|       |    |          Examples: config cache, feature flags map,    |
+|       |    |                    route table                         |
+|       |    |                                                        |
+|       |    +-- NO -> Use sync.Mutex                                |
+|       |             Examples: rate limiter map (every call          |
+|       |                       writes), session store               |
+|       |                                                            |
+|       +-- NO -> Is it coordinating between goroutines?             |
+|            +-- YES -> Use channels                                 |
+|            |          Examples: job queue, results collection,      |
+|            |                    shutdown signaling                  |
+|            |                                                        |
+|            +-- Need one-time init? -> Use sync.Once                |
+|                Examples: DB connection, config loading              |
++-------------------------------------------------------------------+
 ```
 
 ### Pattern 1: Atomic for Simple Counters
@@ -1838,11 +1976,11 @@ func (cs *ConfigStore) GetAll() map[string]string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	// Return a copy so the caller cannot mutate the internal map.
-	copy := make(map[string]string, len(cs.config))
+	result := make(map[string]string, len(cs.config))
 	for k, v := range cs.config {
-		copy[k] = v
+		result[k] = v
 	}
-	return copy
+	return result
 }
 
 // Set updates a config value -- uses Lock (exclusive, blocks all readers).
@@ -1986,27 +2124,27 @@ func main() {
 ### Summary Table
 
 ```
-┌─────────────────────┬─────────────────────────┬──────────────────────────┐
-│ Primitive           │ Best For                │ Web App Example          │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ sync/atomic         │ Simple counters, flags  │ Request metrics,         │
-│                     │ (int64, bool, pointer)  │ active connection count  │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ sync.Mutex          │ Protecting shared data  │ Rate limiter map,        │
-│                     │ with frequent writes    │ session store            │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ sync.RWMutex        │ Protecting shared data  │ Config store, route      │
-│                     │ with many reads, few    │ table, feature flags     │
-│                     │ writes                  │                          │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ Channels            │ Communicating between   │ Job queues, fan-out,     │
-│                     │ goroutines, signaling   │ shutdown signals         │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ sync.Once           │ One-time initialization │ DB pool, logger, config  │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ errgroup            │ Parallel operations     │ Parallel DB queries,     │
-│                     │ with error handling     │ fetching multiple APIs   │
-└─────────────────────┴─────────────────────────┴──────────────────────────┘
++---------------------+-------------------------+--------------------------+
+| Primitive           | Best For                | Web App Example          |
++---------------------+-------------------------+--------------------------+
+| sync/atomic         | Simple counters, flags  | Request metrics,         |
+|                     | (int64, bool, pointer)  | active connection count  |
++---------------------+-------------------------+--------------------------+
+| sync.Mutex          | Protecting shared data  | Rate limiter map,        |
+|                     | with frequent writes    | session store            |
++---------------------+-------------------------+--------------------------+
+| sync.RWMutex        | Protecting shared data  | Config store, route      |
+|                     | with many reads, few    | table, feature flags     |
+|                     | writes                  |                          |
++---------------------+-------------------------+--------------------------+
+| Channels            | Communicating between   | Job queues, fan-out,     |
+|                     | goroutines, signaling   | shutdown signals         |
++---------------------+-------------------------+--------------------------+
+| sync.Once           | One-time initialization | DB pool, logger, config  |
++---------------------+-------------------------+--------------------------+
+| errgroup            | Parallel operations     | Parallel DB queries,     |
+|                     | with error handling     | fetching multiple APIs   |
++---------------------+-------------------------+--------------------------+
 ```
 
 ---
@@ -2167,7 +2305,7 @@ func (lp *LazyPool) Get(ctx context.Context) (*Pool, error) {
 	return lp.pool, nil
 }
 
-// Simulated connection that fails 50% of the time.
+// Simulated connection that fails the first few times.
 var attempt atomic.Int32
 
 func connectToDatabase(ctx context.Context, dsn string) (*Pool, error) {
@@ -2198,6 +2336,17 @@ func main() {
 ### Common Uses of sync.Once in Web Applications
 
 ```go
+package main
+
+import (
+	"html/template"
+	"log/slog"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+)
+
 // 1. Template compilation
 var (
 	tmplOnce sync.Once
@@ -2381,8 +2530,8 @@ func (wp *WorkerPool) Stats() map[string]int64 {
 
 // Stop signals workers to stop and waits for them to finish.
 func (wp *WorkerPool) Stop() {
-	close(wp.jobs)  // Signal no more jobs
-	wp.wg.Wait()    // Wait for all workers and collector to finish
+	close(wp.jobs) // Signal no more jobs
+	wp.wg.Wait()   // Wait for all workers and collector to finish
 	close(wp.results)
 	log.Println("Worker pool stopped")
 }
@@ -2542,25 +2691,55 @@ func main() {
 ### Worker Pool Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                        Worker Pool                                  │
-│                                                                     │
-│   HTTP Handler                      Workers                         │
-│   ┌─────────┐    ┌──────────┐    ┌──────────┐                     │
-│   │ POST    │───►│          │    │ Worker 0 │──► Process ──►       │
-│   │ /api/job│    │  jobs    │    ├──────────┤          │           │
-│   └─────────┘    │ channel  │───►│ Worker 1 │──────────┤           │
-│                  │ (buffer  │    ├──────────┤          │           │
-│   ┌─────────┐    │  = 100)  │    │ Worker 2 │──────────┤   results │
-│   │ POST    │───►│          │    ├──────────┤          ▼   channel │
-│   │ /api/job│    └──────────┘    │ Worker 3 │     ┌────────┐      │
-│   └─────────┘                    ├──────────┤     │Collector│      │
-│                                  │ Worker 4 │     │(logs,  │      │
-│   Response: 202 Accepted         └──────────┘     │metrics)│      │
-│   (returned immediately,                          └────────┘      │
-│    before job is processed)                                        │
-│                                                                     │
-└────────────────────────────────────────────────────────────────────┘
++--------------------------------------------------------------------+
+|                        Worker Pool                                  |
+|                                                                     |
+|   HTTP Handler                      Workers                         |
+|   +---------+    +----------+    +----------+                       |
+|   | POST    |--->|          |    | Worker 0 |--> Process -->        |
+|   | /api/job|    |  jobs    |    +----------+          |            |
+|   +---------+    | channel  |--->| Worker 1 |----------+            |
+|                  | (buffer  |    +----------+          |            |
+|   +---------+    |  = 100)  |    | Worker 2 |----------+   results  |
+|   | POST    |--->|          |    +----------+          v   channel  |
+|   | /api/job|    +----------+    | Worker 3 |     +--------+       |
+|   +---------+                    +----------+     |Collector|       |
+|                                  | Worker 4 |     |(logs,  |       |
+|   Response: 202 Accepted         +----------+     |metrics)|       |
+|   (returned immediately,                          +--------+       |
+|    before job is processed)                                         |
+|                                                                     |
++--------------------------------------------------------------------+
+```
+
+### Node.js Comparison
+
+```javascript
+// Node.js: Bull queue with Redis for background jobs.
+// Go's in-process worker pool is simpler but limited to a single process.
+const Queue = require('bull');
+
+const emailQueue = new Queue('email', {
+    redis: { host: 'localhost', port: 6379 }
+});
+
+// Producer: HTTP handler submits a job
+app.post('/api/jobs', async (req, res) => {
+    const job = await emailQueue.add({
+        to: req.body.to,
+        subject: 'Welcome!',
+    });
+    res.status(202).json({ status: 'accepted', job_id: job.id });
+});
+
+// Consumer: Process jobs (can run in separate process)
+emailQueue.process(5, async (job) => {  // 5 concurrent workers
+    await sendEmail(job.data);
+});
+
+// Key difference: Bull uses Redis for persistence and cross-process sharing.
+// Go's channel-based pool is faster (no network hop) but in-process only.
+// For durability, Go apps also use external queues (Redis, RabbitMQ, SQS).
 ```
 
 ---
@@ -2733,7 +2912,7 @@ func main() {
 
 ```
 Time    Event
-────    ─────────────────────────────────────────────────
+----    ---------------------------------------------------
 0.0s    SIGTERM received
 0.0s    server.Shutdown() called -- stop accepting new connections
 0.0s    In-flight requests continue processing
@@ -2753,18 +2932,18 @@ Time    Event
 
 ```
 WRONG ORDER:
-  pool.Close()       ← Database connections closed
-  bgCancel()         ← Background goroutines try to use pool... PANIC
+  pool.Close()       <-- Database connections closed
+  bgCancel()         <-- Background goroutines try to use pool... PANIC
 
 WRONG ORDER:
-  bgCancel()         ← Background goroutines stopping
-  server.Shutdown()  ← In-flight requests might still need background services
+  bgCancel()         <-- Background goroutines stopping
+  server.Shutdown()  <-- In-flight requests might still need background services
 
 CORRECT ORDER:
-  server.Shutdown()  ← No new requests, wait for in-flight
-  bgCancel()         ← Stop background goroutines
-  wg.Wait()          ← Wait for them to finish
-  pool.Close()       ← Safe: nobody is using the pool anymore
+  server.Shutdown()  <-- No new requests, wait for in-flight
+  bgCancel()         <-- Stop background goroutines
+  wg.Wait()          <-- Wait for them to finish
+  pool.Close()       <-- Safe: nobody is using the pool anymore
 ```
 
 ### Node.js Comparison
@@ -3010,15 +3189,36 @@ Without -race:  Normal performance
 With -race:     ~2-10x slower, ~5-10x more memory
 
 Use -race for:
-  ✓ All tests in CI (go test -race ./...)
-  ✓ Integration tests
-  ✓ Staging environment (build with -race)
-  ✓ Development/debugging
+  [yes] All tests in CI (go test -race ./...)
+  [yes] Integration tests
+  [yes] Staging environment (build with -race)
+  [yes] Development/debugging
 
 Do NOT use -race for:
-  ✗ Production builds (performance overhead)
-  ✗ Benchmarks (skews results)
+  [no] Production builds (performance overhead)
+  [no] Benchmarks (skews results)
 ```
+
+### Integrating Race Detection into CI/CD
+
+Every serious Go project should run the race detector in CI. Here is a minimal GitHub Actions workflow:
+
+```yaml
+# .github/workflows/test.yml
+name: Test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: go test -race -count=5 -timeout=300s ./...
+```
+
+The `-count=5` flag runs each test 5 times. Since races are non-deterministic, multiple runs increase the probability of catching them. The `-timeout=300s` gives longer tests time to complete under the race detector's overhead.
 
 ---
 
@@ -3028,6 +3228,8 @@ Do NOT use -race for:
 
 ```go
 package main
+
+import "time"
 
 // BUG: This will crash with "fatal error: concurrent map read and map write"
 // in production, usually at 3 AM under peak traffic.
@@ -3047,7 +3249,7 @@ func (s *SessionStore) Get(id string) *Session {
 }
 
 func (s *SessionStore) Set(id string, sess *Session) {
-	s.sessions[id] = sess // CONCURRENT WRITE → CRASH
+	s.sessions[id] = sess // CONCURRENT WRITE -> CRASH
 }
 ```
 
@@ -3252,7 +3454,6 @@ func main() {
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 )
@@ -3260,7 +3461,7 @@ import (
 // BUG: Forgetting to close rows leaks a database connection.
 // After MaxConns calls, all connections are leaked and the pool is exhausted.
 // New queries block forever (or until timeout).
-func buggyQuery(ctx context.Context, pool interface{}) {
+func buggyQuery() {
 	// rows, err := pool.Query(ctx, "SELECT id, name FROM users")
 	// if err != nil {
 	//     log.Fatal(err)
@@ -3280,7 +3481,7 @@ func buggyQuery(ctx context.Context, pool interface{}) {
 }
 
 // FIX: Always defer rows.Close().
-func fixedQuery(ctx context.Context, pool interface{}) {
+func fixedQuery() {
 	// rows, err := pool.Query(ctx, "SELECT id, name FROM users")
 	// if err != nil {
 	//     log.Fatal(err)
@@ -3357,34 +3558,114 @@ func main() {
 }
 ```
 
+### Bug 6: Deadlock from Nested Locking
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// BUG: Calling a method that acquires the same lock from within a locked section.
+// sync.Mutex is NOT reentrant in Go -- this will deadlock.
+type UserCache struct {
+	mu    sync.Mutex
+	users map[string]string
+}
+
+func (c *UserCache) Get(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.users[id]
+}
+
+func (c *UserCache) GetOrDefault(id, defaultName string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// BUG: Get() tries to acquire c.mu, but we already hold it.
+	// DEADLOCK: this goroutine waits for itself to release the lock.
+	name := c.Get(id) // DEADLOCK!
+	if name == "" {
+		return defaultName
+	}
+	return name
+}
+
+// FIX: Use internal helpers that assume the lock is already held.
+type FixedUserCache struct {
+	mu    sync.Mutex
+	users map[string]string
+}
+
+func (c *FixedUserCache) Get(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.get(id) // Call the internal helper
+}
+
+// get is the internal version that assumes mu is already held.
+func (c *FixedUserCache) get(id string) string {
+	return c.users[id]
+}
+
+func (c *FixedUserCache) GetOrDefault(id, defaultName string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	name := c.get(id) // No deadlock -- get() does not acquire the lock
+	if name == "" {
+		return defaultName
+	}
+	return name
+}
+
+func main() {
+	cache := &FixedUserCache{
+		users: map[string]string{
+			"u1": "Alice",
+		},
+	}
+
+	fmt.Println(cache.Get("u1"))
+	fmt.Println(cache.GetOrDefault("u2", "Unknown"))
+}
+```
+
 ### Summary of Real-World Bugs
 
 ```
-┌──────────────────────────────┬─────────────────────────────────────────┐
-│ Bug                          │ Prevention                              │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Concurrent map write         │ Always protect maps with sync.Mutex    │
-│                              │ or sync.RWMutex                        │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Write to ResponseWriter      │ Never pass w to goroutines that        │
-│ after handler returns        │ outlive the handler                    │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Goroutine leak               │ Every goroutine must have a guaranteed │
-│                              │ exit path (context, buffered channel)  │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Connection pool exhaustion   │ Always defer rows.Close() / conn.      │
-│                              │ Release()                              │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Mutex copied by value        │ Use pointer receivers on types with    │
-│                              │ sync primitives. Use go vet.           │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Deadlock from lock ordering  │ Always acquire multiple locks in       │
-│                              │ consistent order (e.g., by address)    │
-├──────────────────────────────┼─────────────────────────────────────────┤
-│ Race on error handling path  │ Run go test -race -count=10. Test      │
-│                              │ error paths as thoroughly as happy      │
-│                              │ paths.                                  │
-└──────────────────────────────┴─────────────────────────────────────────┘
++------------------------------+-----------------------------------------+
+| Bug                          | Prevention                              |
++------------------------------+-----------------------------------------+
+| Concurrent map write         | Always protect maps with sync.Mutex     |
+|                              | or sync.RWMutex                         |
++------------------------------+-----------------------------------------+
+| Write to ResponseWriter      | Never pass w to goroutines that         |
+| after handler returns        | outlive the handler                     |
++------------------------------+-----------------------------------------+
+| Goroutine leak               | Every goroutine must have a guaranteed  |
+|                              | exit path (context, buffered channel)   |
++------------------------------+-----------------------------------------+
+| Connection pool exhaustion   | Always defer rows.Close() / conn.       |
+|                              | Release()                               |
++------------------------------+-----------------------------------------+
+| Mutex copied by value        | Use pointer receivers on types with     |
+|                              | sync primitives. Use go vet.            |
++------------------------------+-----------------------------------------+
+| Deadlock from nested locking | Use internal helpers that assume lock    |
+|                              | is held. Never call public Lock methods |
+|                              | from within a locked section.           |
++------------------------------+-----------------------------------------+
+| Deadlock from lock ordering  | Always acquire multiple locks in        |
+|                              | consistent order (e.g., by address)     |
++------------------------------+-----------------------------------------+
+| Race on error handling path  | Run go test -race -count=10. Test       |
+|                              | error paths as thoroughly as happy      |
+|                              | paths.                                  |
++------------------------------+-----------------------------------------+
 ```
 
 ---
@@ -3461,11 +3742,7 @@ func (r *StatsRepo) GetStats(ctx context.Context, userID string) (*Stats, error)
 	delay := time.Duration(50+rand.Intn(100)) * time.Millisecond
 	select {
 	case <-time.After(delay):
-		return &Stats{
-			TotalSessions: 142,
-			TotalMinutes:  4260,
-			AverageScore:  87.3,
-		}, nil
+		return &Stats{TotalSessions: 142, TotalMinutes: 4260, AverageScore: 87.5}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -3473,14 +3750,14 @@ func (r *StatsRepo) GetStats(ctx context.Context, userID string) (*Stats, error)
 
 type SessionRepo struct{}
 
-func (r *SessionRepo) GetRecent(ctx context.Context, userID string) ([]*Session, error) {
+func (r *SessionRepo) GetRecent(ctx context.Context, userID string, limit int) ([]*Session, error) {
 	delay := time.Duration(80+rand.Intn(120)) * time.Millisecond
 	select {
 	case <-time.After(delay):
 		return []*Session{
-			{ID: "s1", Topic: "Goroutines", Score: 92, CreatedAt: time.Now().Add(-1 * time.Hour)},
-			{ID: "s2", Topic: "Channels", Score: 88, CreatedAt: time.Now().Add(-2 * time.Hour)},
-			{ID: "s3", Topic: "Context", Score: 95, CreatedAt: time.Now().Add(-3 * time.Hour)},
+			{ID: "s1", Topic: "Go Concurrency", Score: 92, CreatedAt: time.Now().Add(-1 * time.Hour)},
+			{ID: "s2", Topic: "HTTP Handlers", Score: 88, CreatedAt: time.Now().Add(-2 * time.Hour)},
+			{ID: "s3", Topic: "Database Patterns", Score: 95, CreatedAt: time.Now().Add(-3 * time.Hour)},
 		}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -3493,30 +3770,31 @@ func (r *ProgressRepo) GetProgress(ctx context.Context, userID string) (*Progres
 	delay := time.Duration(30+rand.Intn(70)) * time.Millisecond
 	select {
 	case <-time.After(delay):
-		return &Progress{
-			Level:         12,
-			XP:            3400,
-			CompletionPct: 68.5,
-		}, nil
+		return &Progress{Level: 7, XP: 3450, CompletionPct: 68.5}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
+// Simulated token store for background cleanup.
 type TokenRepo struct{}
 
 func (r *TokenRepo) DeleteExpiredTokens(ctx context.Context) (int64, error) {
 	select {
 	case <-time.After(50 * time.Millisecond):
-		// Simulate finding 0-3 expired tokens
-		return int64(rand.Intn(4)), nil
+		// Simulate finding expired tokens occasionally
+		if rand.Intn(3) == 0 {
+			n := int64(rand.Intn(10) + 1)
+			return n, nil
+		}
+		return 0, nil
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
 }
 
 // ============================================================
-// Rate Limiter (Sections 2 & 3)
+// Rate Limiter (Sections 2 + 3)
 // ============================================================
 
 type visitor struct {
@@ -3527,21 +3805,21 @@ type visitor struct {
 type RateLimiter struct {
 	mu       sync.Mutex
 	visitors map[string]*visitor
-	rate     rate.Limit
-	burst    int
+	r        rate.Limit
+	b        int
 	wg       sync.WaitGroup
 }
 
-func NewRateLimiter(ctx context.Context, r rate.Limit, b int) *RateLimiter {
+func NewRateLimiter(ctx context.Context, r rate.Limit, b int, cleanupInterval time.Duration) *RateLimiter {
 	rl := &RateLimiter{
 		visitors: make(map[string]*visitor),
-		rate:     r,
-		burst:    b,
+		r:        r,
+		b:        b,
 	}
 	rl.wg.Add(1)
 	go func() {
 		defer rl.wg.Done()
-		rl.cleanup(ctx)
+		rl.cleanup(ctx, cleanupInterval)
 	}()
 	return rl
 }
@@ -3549,22 +3827,30 @@ func NewRateLimiter(ctx context.Context, r rate.Limit, b int) *RateLimiter {
 func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
 	v, exists := rl.visitors[ip]
 	if !exists {
-		v = &visitor{limiter: rate.NewLimiter(rl.rate, rl.burst)}
+		v = &visitor{limiter: rate.NewLimiter(rl.r, rl.b)}
 		rl.visitors[ip] = v
 	}
 	v.lastSeen = time.Now()
 	return v.limiter.Allow()
 }
 
-func (rl *RateLimiter) cleanup(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
+func (rl *RateLimiter) VisitorCount() int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.visitors)
+}
+
+func (rl *RateLimiter) cleanup(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[rate-limiter] cleanup stopped")
+			log.Println("[rate-limiter] cleanup goroutine stopped")
 			return
 		case <-ticker.C:
 			rl.mu.Lock()
@@ -3577,20 +3863,13 @@ func (rl *RateLimiter) cleanup(ctx context.Context) {
 			after := len(rl.visitors)
 			rl.mu.Unlock()
 			if before != after {
-				log.Printf("[rate-limiter] cleaned %d stale entries (%d remaining)",
-					before-after, after)
+				log.Printf("[rate-limiter] cleaned %d stale visitors (%d remaining)", before-after, after)
 			}
 		}
 	}
 }
 
-func (rl *RateLimiter) VisitorCount() int {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	return len(rl.visitors)
-}
-
-func (rl *RateLimiter) Stop() {
+func (rl *RateLimiter) Wait() {
 	rl.wg.Wait()
 }
 
@@ -3599,60 +3878,11 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		if !rl.Allow(r.RemoteAddr) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error": "rate limit exceeded",
-			})
+			json.NewEncoder(w).Encode(map[string]string{"error": "rate limit exceeded"})
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// ============================================================
-// Token Cleanup Service (Section 7)
-// ============================================================
-
-type TokenCleanupService struct {
-	repo     *TokenRepo
-	interval time.Duration
-	wg       sync.WaitGroup
-}
-
-func NewTokenCleanupService(repo *TokenRepo, interval time.Duration) *TokenCleanupService {
-	return &TokenCleanupService{repo: repo, interval: interval}
-}
-
-func (s *TokenCleanupService) Start(ctx context.Context) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		ticker := time.NewTicker(s.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("[token-cleanup] stopped")
-				return
-			case <-ticker.C:
-				cleanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				deleted, err := s.repo.DeleteExpiredTokens(cleanCtx)
-				cancel()
-				if err != nil {
-					if ctx.Err() == nil {
-						log.Printf("[token-cleanup] error: %v", err)
-					}
-					continue
-				}
-				if deleted > 0 {
-					log.Printf("[token-cleanup] deleted %d expired tokens", deleted)
-				}
-			}
-		}
-	}()
-}
-
-func (s *TokenCleanupService) Stop() {
-	s.wg.Wait()
 }
 
 // ============================================================
@@ -3671,7 +3901,7 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		m.activeRequests.Add(1)
 		defer m.activeRequests.Add(-1)
 
-		sw := &statusCapture{ResponseWriter: w, status: 200}
+		sw := &statusWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(sw, r)
 
 		if sw.status >= 500 {
@@ -3680,7 +3910,7 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (m *Metrics) Stats() map[string]int64 {
+func (m *Metrics) Snapshot() map[string]int64 {
 	return map[string]int64{
 		"total_requests":  m.totalRequests.Load(),
 		"active_requests": m.activeRequests.Load(),
@@ -3688,131 +3918,194 @@ func (m *Metrics) Stats() map[string]int64 {
 	}
 }
 
-type statusCapture struct {
+type statusWriter struct {
 	http.ResponseWriter
 	status int
 }
 
-func (w *statusCapture) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
 }
 
 // ============================================================
-// Dashboard Handler (Section 6)
+// Token Cleanup Service (Section 7)
+// ============================================================
+
+type TokenCleaner struct {
+	repo     *TokenRepo
+	interval time.Duration
+	wg       sync.WaitGroup
+}
+
+func NewTokenCleaner(repo *TokenRepo, interval time.Duration) *TokenCleaner {
+	return &TokenCleaner{repo: repo, interval: interval}
+}
+
+func (tc *TokenCleaner) Start(ctx context.Context) {
+	tc.wg.Add(1)
+	go func() {
+		defer tc.wg.Done()
+		tc.run(ctx)
+	}()
+	log.Printf("[token-cleaner] started (interval: %s)", tc.interval)
+}
+
+func (tc *TokenCleaner) run(ctx context.Context) {
+	// Clean once on startup
+	tc.doCleanup(ctx)
+
+	ticker := time.NewTicker(tc.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[token-cleaner] stopped")
+			return
+		case <-ticker.C:
+			tc.doCleanup(ctx)
+		}
+	}
+}
+
+func (tc *TokenCleaner) doCleanup(ctx context.Context) {
+	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	deleted, err := tc.repo.DeleteExpiredTokens(cleanupCtx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return // Shutting down
+		}
+		log.Printf("[token-cleaner] ERROR: %v", err)
+		return
+	}
+	if deleted > 0 {
+		log.Printf("[token-cleaner] deleted %d expired tokens", deleted)
+	}
+}
+
+func (tc *TokenCleaner) Wait() {
+	tc.wg.Wait()
+}
+
+// ============================================================
+// Dashboard Handler (Section 6 - Parallel Queries)
 // ============================================================
 
 type DashboardHandler struct {
-	statsRepo    *StatsRepo
-	sessionRepo  *SessionRepo
-	progressRepo *ProgressRepo
+	stats    *StatsRepo
+	sessions *SessionRepo
+	progress *ProgressRepo
 }
 
 func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userID := "user-123" // In production: extract from auth middleware
+	userID := "user-123" // In production: from auth middleware
 
-	g, gCtx := errgroup.WithContext(ctx)
-
-	var stats *Stats
-	var sessions []*Session
-	var progress *Progress
+	var resp DashboardResponse
+	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		var err error
-		stats, err = h.statsRepo.GetStats(gCtx, userID)
-		return err
+		s, err := h.stats.GetStats(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("stats: %w", err)
+		}
+		resp.Stats = s
+		return nil
 	})
 
 	g.Go(func() error {
-		var err error
-		sessions, err = h.sessionRepo.GetRecent(gCtx, userID)
-		return err
+		s, err := h.sessions.GetRecent(ctx, userID, 5)
+		if err != nil {
+			return fmt.Errorf("sessions: %w", err)
+		}
+		resp.Sessions = s
+		return nil
 	})
 
 	g.Go(func() error {
-		var err error
-		progress, err = h.progressRepo.GetProgress(gCtx, userID)
-		return err
+		p, err := h.progress.GetProgress(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("progress: %w", err)
+		}
+		resp.Progress = p
+		return nil
 	})
 
 	if err := g.Wait(); err != nil {
 		if ctx.Err() != nil {
-			log.Printf("[dashboard] request cancelled: %v", ctx.Err())
+			log.Printf("Dashboard cancelled: %v", ctx.Err())
 			return
 		}
-		log.Printf("[dashboard] error: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "failed to load dashboard"})
+		log.Printf("Dashboard error: %v", err)
+		http.Error(w, `{"error": "failed to load dashboard"}`, http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(DashboardResponse{
-		Stats:    stats,
-		Sessions: sessions,
-		Progress: progress,
-	})
+	json.NewEncoder(w).Encode(resp)
 }
 
 // ============================================================
-// Health Check Handler
-// ============================================================
-
-type HealthHandler struct {
-	metrics  *Metrics
-	limiter  *RateLimiter
-}
-
-func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"status":   "ok",
-		"metrics":  h.metrics.Stats(),
-		"visitors": h.limiter.VisitorCount(),
-	})
-}
-
-// ============================================================
-// Main: Wire everything together with graceful shutdown
+// Main -- Wiring Everything Together
 // ============================================================
 
 func main() {
-	log.SetFlags(log.Ltime | log.Lshortfile)
-
-	// Background context for all background goroutines.
+	// --- Context for background goroutines ---
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 
-	// Initialize services.
-	limiter := NewRateLimiter(bgCtx, 10, 20) // 10 req/s, burst 20
+	// --- Rate limiter with background cleanup ---
+	limiter := NewRateLimiter(bgCtx, 10, 20, 1*time.Minute)
+	log.Println("[rate-limiter] started (10 req/s per IP, burst 20)")
+
+	// --- Request metrics ---
 	metrics := &Metrics{}
 
-	tokenCleaner := NewTokenCleanupService(&TokenRepo{}, 1*time.Hour)
+	// --- Token cleanup service ---
+	tokenCleaner := NewTokenCleaner(&TokenRepo{}, 30*time.Second) // Short for demo
 	tokenCleaner.Start(bgCtx)
 
-	dashboardHandler := &DashboardHandler{
-		statsRepo:    &StatsRepo{},
-		sessionRepo:  &SessionRepo{},
-		progressRepo: &ProgressRepo{},
+	// --- Dashboard handler ---
+	dashboard := &DashboardHandler{
+		stats:    &StatsRepo{},
+		sessions: &SessionRepo{},
+		progress: &ProgressRepo{},
 	}
 
-	healthHandler := &HealthHandler{
-		metrics: metrics,
-		limiter: limiter,
-	}
-
-	// Routes.
+	// --- HTTP routes ---
 	mux := http.NewServeMux()
-	mux.Handle("/api/dashboard", dashboardHandler)
-	mux.Handle("/health", healthHandler)
-	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, `{"pong": true}`)
+
+	mux.Handle("/api/dashboard", dashboard)
+
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	// Middleware chain: metrics → rate limiter → router.
+	mux.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		data := metrics.Snapshot()
+		data["rate_limiter_visitors"] = int64(limiter.VisitorCount())
+		json.NewEncoder(w).Encode(data)
+	})
+
+	mux.HandleFunc("/api/slow", func(w http.ResponseWriter, r *http.Request) {
+		// Simulate a slow endpoint for testing graceful shutdown
+		select {
+		case <-time.After(3 * time.Second):
+			json.NewEncoder(w).Encode(map[string]string{"status": "done"})
+		case <-r.Context().Done():
+			log.Printf("Slow request cancelled: %v", r.Context().Err())
+		}
+	})
+
+	// --- Apply middleware stack ---
+	// Order: metrics -> rate limiter -> routes
 	handler := metrics.Middleware(limiter.Middleware(mux))
 
+	// --- HTTP server ---
 	server := &http.Server{
 		Addr:              ":8080",
 		Handler:           handler,
@@ -3822,99 +4115,97 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Start HTTP server.
+	// --- Start HTTP server in a goroutine ---
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Println("Server starting on :8080")
-		log.Println("  GET /api/dashboard  -- parallel queries demo")
-		log.Println("  GET /api/ping       -- simple ping")
-		log.Println("  GET /health         -- health check + metrics")
+		log.Println("[http] server starting on :8080")
+		log.Println("[http] endpoints:")
+		log.Println("[http]   GET /api/dashboard  -- parallel queries demo")
+		log.Println("[http]   GET /api/health     -- health check")
+		log.Println("[http]   GET /api/metrics    -- request metrics")
+		log.Println("[http]   GET /api/slow       -- slow endpoint (3s)")
 		if err := server.ListenAndServe(); err != http.ErrServerClosed {
 			serverErr <- err
 		}
 		close(serverErr)
 	}()
 
-	// Wait for shutdown signal.
+	// --- Wait for shutdown signal ---
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
 	case sig := <-quit:
-		log.Printf("Received %s signal", sig)
+		log.Printf("[shutdown] received signal: %s", sig)
 	case err := <-serverErr:
-		log.Printf("Server error: %v", err)
+		log.Printf("[shutdown] server error: %v", err)
 	}
 
-	// Graceful shutdown sequence.
-	log.Println("=== GRACEFUL SHUTDOWN STARTING ===")
+	// --- Graceful shutdown sequence ---
+	log.Println("[shutdown] starting graceful shutdown...")
 
-	// 1. Stop accepting new requests, wait for in-flight.
+	// Step 1: Stop accepting new requests, wait for in-flight
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP shutdown error: %v", err)
-	}
-	log.Println("HTTP server stopped")
 
-	// 2. Cancel all background goroutines.
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[shutdown] HTTP server error: %v", err)
+	} else {
+		log.Println("[shutdown] HTTP server stopped")
+	}
+
+	// Step 2: Cancel background goroutines
 	bgCancel()
 
-	// 3. Wait for background goroutines to finish.
-	limiter.Stop()
-	tokenCleaner.Stop()
-	log.Println("Background services stopped")
+	// Step 3: Wait for background goroutines to finish
+	limiter.Wait()
+	log.Println("[shutdown] rate limiter cleanup stopped")
 
-	// 4. Close database pool (if we had one).
+	tokenCleaner.Wait()
+	log.Println("[shutdown] token cleaner stopped")
+
+	// Step 4: Close database pool (in production)
 	// pool.Close()
+	log.Println("[shutdown] database pool closed")
 
-	log.Println("=== SHUTDOWN COMPLETE ===")
+	// Print final metrics
+	finalMetrics := metrics.Snapshot()
+	log.Printf("[shutdown] final metrics: total=%d active=%d errors=%d",
+		finalMetrics["total_requests"],
+		finalMetrics["active_requests"],
+		finalMetrics["total_errors"],
+	)
+
+	log.Println("[shutdown] complete")
 }
 ```
 
 ### Testing the Complete System
 
 ```bash
-# Terminal 1: Run the server
+# Start the server
 go run main.go
 
-# Terminal 2: Test the dashboard (parallel queries)
-curl -s localhost:8080/api/dashboard | jq .
+# In another terminal:
 
-# Terminal 3: Test rate limiting (send 25 rapid requests)
+# Test the dashboard (parallel queries)
+curl http://localhost:8080/api/dashboard | jq
+
+# Test metrics
+curl http://localhost:8080/api/metrics | jq
+
+# Test rate limiting (send 25 rapid requests)
 for i in $(seq 1 25); do
-  curl -s -o /dev/null -w "Request $i: %{http_code}\n" localhost:8080/api/ping
+    curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/dashboard
 done
-# First ~20 should be 200, then 429 (rate limited)
+# You should see 200s followed by 429s (Too Many Requests)
 
-# Terminal 4: Check health/metrics
-curl -s localhost:8080/health | jq .
-
-# Terminal 5: Graceful shutdown
+# Test graceful shutdown
+# Start a slow request:
+curl http://localhost:8080/api/slow &
+# Immediately send SIGTERM:
 kill -SIGTERM $(pgrep -f "go run main.go")
-# Watch Terminal 1 for the shutdown sequence
-```
-
-### What This System Demonstrates
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  CONCURRENCY PRIMITIVES USED IN THIS SYSTEM                    │
-├──────────────────────┬──────────────────────────────────────────┤
-│ Primitive            │ Where Used                               │
-├──────────────────────┼──────────────────────────────────────────┤
-│ goroutine per request│ net/http server (automatic)              │
-│ sync.Mutex           │ RateLimiter.visitors map                 │
-│ sync/atomic          │ Metrics counters                         │
-│ time.Ticker          │ Rate limiter cleanup, token cleanup      │
-│ context.Context      │ Request cancellation, shutdown signal    │
-│ errgroup             │ Parallel dashboard queries               │
-│ sync.WaitGroup       │ Background service lifecycle             │
-│ channels             │ Server error, shutdown signal            │
-│ select               │ Ticker loops, timeout handling           │
-│ context.WithTimeout  │ Per-operation timeouts                   │
-│ context.WithCancel   │ Background goroutine lifecycle           │
-└──────────────────────┴──────────────────────────────────────────┘
+# The slow request should complete before the server exits
 ```
 
 ---
@@ -3969,34 +4260,38 @@ Build an HTTP handler that fetches data from three external APIs in parallel and
 
 Requirements:
 - Use `errgroup.WithContext` for parallel fetching
-- If any API call fails, cancel the others and return an error
-- Add a per-request timeout of 5 seconds
-- If the client disconnects, all API calls should be cancelled
-- Track metrics: total requests, average response time, error count per API
-- Write a test that verifies cancellation works correctly
+- If any API call fails, return a partial response with the successful results (do not fail the entire request)
+- Set per-API timeouts (API A: 2s, API B: 5s, API C: 1s)
+- If the client disconnects, all pending API calls should be cancelled
+- Return timing information for each API call in the response
 
-### Exercise 3: In-Memory Cache with TTL and Background Eviction
+Hint: Use separate errgroup goroutines that write to different fields, and handle individual errors within each goroutine instead of returning them.
 
-Build a concurrent-safe in-memory cache with:
+### Exercise 3: Connection Pool Monitor
 
-```go
-type Cache[K comparable, V any] struct {
-    // Your implementation
+Build a middleware that monitors database connection pool health and exposes it as a `/debug/pool` endpoint:
+
+```json
+{
+    "total_connections": 25,
+    "idle_connections": 20,
+    "acquired_connections": 5,
+    "max_connections": 25,
+    "wait_count": 150,
+    "wait_duration_avg_ms": 12.5,
+    "samples": [
+        {"time": "2024-01-15T10:00:00Z", "acquired": 5, "idle": 20},
+        {"time": "2024-01-15T10:00:05Z", "acquired": 12, "idle": 13}
+    ]
 }
-
-func (c *Cache[K, V]) Get(key K) (V, bool)
-func (c *Cache[K, V]) Set(key K, value V, ttl time.Duration)
-func (c *Cache[K, V]) Delete(key K)
-func (c *Cache[K, V]) Len() int
 ```
 
 Requirements:
-- Thread-safe using `sync.RWMutex` (reads with `RLock`, writes with `Lock`)
-- TTL-based expiration: items expire after their TTL
-- Background eviction goroutine that runs every 30 seconds and removes expired items
-- Context-based lifecycle (background goroutine stops when context is cancelled)
-- Run `go test -race -count=100` to verify no race conditions
-- Benchmark `Get` performance with 100 concurrent goroutines
+- Sample pool stats every 5 seconds in a background goroutine
+- Keep the last 60 samples (5 minutes of data)
+- Use a ring buffer (not a growing slice)
+- Thread-safe access to the samples
+- Context-based lifecycle for the sampling goroutine
 
 ### Exercise 4: Graceful Shutdown with Drain
 
@@ -4027,6 +4322,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -4109,5 +4405,3 @@ Requirements:
 - Context-based lifecycle for the sampling goroutine
 
 ---
-
-> **Next Chapter:** Chapter 32 will cover Authentication and Security Patterns in Go APIs -- JWT handling, bcrypt password hashing, secure middleware chains, CORS, CSRF protection, and secrets management.
